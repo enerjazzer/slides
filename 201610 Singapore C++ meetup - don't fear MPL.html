@@ -1,0 +1,595 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Title</title>
+    <meta charset="utf-8">
+    <style>
+        @import url(https://fonts.googleapis.com/css?family=Yanone+Kaffeesatz);
+        @import url(https://fonts.googleapis.com/css?family=Droid+Serif:400,700,400italic);
+        @import url(https://fonts.googleapis.com/css?family=Ubuntu+Mono:400,700,400italic);
+
+        body { font-family: 'Droid Serif'; }
+        h1, h2, h3 {
+            font-family: 'Yanone Kaffeesatz';
+            font-weight: normal;
+        }
+        .remark-code, .remark-inline-code { font-family: 'Ubuntu Mono'; }
+    </style>
+</head>
+<body>
+<textarea id="source">
+
+class: center, middle
+
+# Don't fear MPL!
+## (with a real-life heterogeneous queue example)
+
+Maxim Yanchenko
+
+the code is here: http://ideone.com/eU5Eyi
+
+???
+As this is the first C++ meet-up, we decided to go with something more **practical** and on more **basic level**.
+
+And speaking of practical, I've heard many times from many **experienced programmers** that libraries like Boost
+are just for **language lawyers** and their only users are their **authors and similar geeks**
+and Boost is **not usable** in practice.
+
+This especially applies to **meta-programming** libraries like MPL, Preprocessor, Proto, and more recent Hana.
+
+So I just wanted to demonstrate how Boost (namely, Boost.MPL and Boost.Variant) can make life **much easier**.
+
+This is a **real example** but with of course **all names were changed** to not offend anyone :)
+---
+
+# Real-life Problem
+### What we have now
+Real-time processing of incoming messages.
+
+--
+
+1. A very old messaging API to an (unnamed) stock exchange.
+
+???
+Very old API, it's not in use anymore.
+
+It had many funny features, but I'll start with **brief description** of what we already had before approaching the task I had in hand.
+--
+
+2. Every message is encoded in a distinct type `Msg1`, `Msg2`, etc.
+
+--
+
+3. API works in terms of callbacks:<br>
+    you register a callback in the API
+    ```cpp
+    void my_callback( const Msg1& msg ) { ... }
+
+    api.register_callback_for_msg1( &my_callback );
+    ```
+    and then the API will call it when `Msg1` arrives.
+
+???
+
+`my_callback` is just an overloaded function
+
+**Order of messages matters!** Single event - multiple messages in certain order.
+
+---
+
+# Real-life Problem
+### What we need to add
+
+On restart, recover and process all old messages (and reuse the code we already have).
+
+--
+
+###Problems
+
+--
+
+* The server replays old  messages **NOT** in the same order as in real-time.
+
+But of course we'd like to process them in correct order, otherwise the logic will be broken!
+
+This means we need receive all messages first, store it somewhere, sort, and then process.
+
+???
+**Order of messages matters!** Single event - multiple messages in certain order.
+
+--
+
+* Classes `Msg1`, `Msg2` etc don't inherit from the same base class `BaseMsg`, so we can't store as usual `std::vector<BaseMsg*>`.
+
+---
+
+# Analysis
+(before we start coding)
+
+???
+Let's think about sorting
+---
+
+# Analysis
+
+* How to sort?
+Each message has a timestamp field. But this field is different in each class!
+
+???
+Fortunately, representation is same so we can compare timestamps directly (e.g. with `strcmp`).
+
+--
+
+  **Solution**: have an overloaded function `get_time_field(Msg1)` to extract the timestamp.
+
+--
+
+* What if timestamps are same? (quite possible - API time resolution is very bad!)
+
+    We can't process them arbitrary as in real time they always come in certain order, for example:
+    ```
+    Msg1 { seq_num = 456; operation_status = error; error_msg = "Bad price"; }
+    Msg2 { external_id = 123456; order_status = rejected; }
+    ```
+--
+    **Solution**: secondary-sort based on message type, somehow (???)
+
+--
+
+* What if timestamp **AND** message type is same?
+
+--
+
+    **Solution**: tertiary-sort by something specific to the message type <br>
+    (e.g. `seq_num` for `Msg1`, `external_id` for `Msg2` etc) with an overloaded function like `compare_type(MsgN,MsgN)`.
+
+---
+
+# What do we have so far?
+1. Overloaded `get_time_field(MsgN)` to sort different messages by time;
+2. Overloaded `compare_type(MsgN,MsgN)` to sort messages of the same type.
+
+These things will be always needed whatever storage we end up with.
+
+--
+
+# What is left?
+
+--
+
+1. Sort messages of different type but same timestamp;
+2. Store messages of different types in a single container;
+3. (bonus) Reuse the callback functions we already have (well-tested, already in PROD!)
+
+---
+
+# Solution
+
+1. Container will hold a variant type. I used `boost::variant` as it supports *static visitation*.
+
+2. Container is going to be a `std::multiset` with *static visitation*-based comparison object.
+
+3. *Static visitation* will naturally reuse our existing callbacks.
+
+Therefore, tasks 2 (sorted storage) and 3 (reuse of callbacks) from the previous slides are solved; let's look at sorting, but first...
+
+???
+
+A variant is a union that knows its type. So you usually have a **current type** tag member and **switch** for processing -
+`boost::variant` does all that stuff for you.
+
+---
+
+### What is static visitation?
+
+--
+
+A variant holds one from a set of types. You provide an overloaded (or even a template) function - and variant will call it with actual type inside.
+
+???
+You don't need to do **switch** etc - variant does all the job for you
+
+--
+
+*** Real case***: We want to print all the messages (The API provides printing but it's not `const`!). This static visitor works as a printer:
+```cpp
+struct MsgPrinter : boost::static_visitor<> {
+  template <class T>
+  void operator()(const T& x) const { const_cast<T&>(x).print(); }
+};
+```
+Now we can print all the messages in our constant queue:
+```cpp
+MsgPrinter printer;
+std::for_each( msgs.cbegin(), msgs.cend(), boost::apply_visitor( printer ) );
+```
+???
+print
+--
+Similarly, we'll reuse the existing callbacks:
+```cpp
+struct CbCaller : boost::static_visitor<> {
+  template <class T>
+  void operator()(const T& x) const { my_callback(x); }
+};
+```
+???
+Callbacks
+---
+
+# Sorting
+
+1. We already have comparison by time (`get_time_field`) and within the same type (`compare_type`)
+2. Let's implement sorting across different message types with the same timestamp.
+
+???
+How you would implement comparison of pre-ordered objects?<br/>
+You would put all the objects in a container in that order, and then for any given pair of objects, you'll just find them in the container and compare their positions.
+
+E.g. `std::vector<red,green,blue>`
+
+Same here. But with types.
+
+--
+
+Let's put all *types* in a container (container of *types*):
+```cpp
+  typedef boost::mpl::vector< Msg1, Msg2, Msg3 > MsgTypes;
+```
+
+--
+
+Now we can compare *types* just by position in the container of *types*:
+```cpp
+  template <typename T, typename U>
+  bool compare_type(const T& left, const U& right) const
+  {
+    // compare type position in the MsgTypes
+    return
+      boost::mpl::find< MsgTypes, T >::type::pos::value
+      <
+      boost::mpl::find< MsgTypes, U >::type::pos::value;
+  }
+```
+
+---
+
+# What's going on here?
+```cpp
+      boost::mpl::find< MsgTypes, T >::type::pos::value
+```
+
+--
+
+## Enter the Metafunction
+
+???
+What is "normal" functions? Think of a function `add_five`. You give it 2 - it gives you 7,
+
+A metafunction is same thing, but about types: you give it a type - it gives you another type.
+
+No direct support in C++.
+
+--
+
+It's just a class with a public type `type` inside:
+```cpp
+template< class T >
+struct add_pointer
+{
+  typedef T* type;
+};
+```
+Now we can "call" the metafunction and it will "return" a type:
+```cpp
+add_pointer<int>::type p; // We just declared a variable p with type int*
+```
+
+???
+You give it type - it gives you pointer type
+---
+
+# What's going on here?
+```cpp
+      boost::mpl::find< MsgTypes, T >::type::pos::value
+```
+
+--
+
+`Boost.MPL` mimics STL, both in containers (`vector`) and algorithms (`find`).
+
+--
+
+Therefore:
+* `boost::mpl::find<MsgTypes, T>` &mdash; is the algorithm to find type `T` in a type sequence `MsgTypes`
+--
+
+* `boost::mpl::find<MsgTypes, T>::type` &mdash; is the algorithm **call** and it returns an iterator in the type sequence. Iterator is a type itself!
+--
+
+* `boost::mpl::find<MsgTypes, T>::type::pos` &mdash; is the iterator's position. It's still a type, too! and it has a constant `value` inside.
+--
+
+* `boost::mpl::find<MsgTypes, T>::type::pos::value` &mdash; is actual position as a compile-time constant integral value.
+
+???
+
+Note that the value is a compile-time constant, so the whole function willl be converted to just
+* `return 1<2;`
+
+i.e.
+* `return true;`
+--
+
+### Bonus:
+The type `variant` can be created from the `MsgTypes` directly!
+
+---
+
+# Final solution (one page of code)
+(won't fit in one slide, though)
+```cpp
+#include <set>
+
+#include "boost/variant.hpp"
+#include "boost/mpl/vector.hpp"
+#include "boost/mpl/find.hpp"
+
+#include "MsgAPI.hpp" // defines Msg1, Msg2, Msg3
+
+// Order of messages
+typedef boost::mpl::vector< Msg1, Msg2, Msg3 > MsgTypes;
+
+// The variant Msg (let's call it MegaMsg) :)
+typedef boost::make_variant_over< MsgTypes >::type MegaMsg;
+
+// The queue
+typedef std::multiset< MegaMsg, MsgComparer > Msgs;
+
+// timestamp is a string like "2001-02-03-04:05:06.00007"
+const char* get_time_field( const Msg1& x ) const { return x.sending_time; }
+const char* get_time_field( const Msg2& x ) const { return x.update_time;  }
+const char* get_time_field( const Msg3& x ) const { return x.orig_time;    }
+```
+What is `MsgComparer`?
+---
+```cpp
+class MsgComparer : public boost::static_visitor<bool>
+{
+  template <typename T, typename U>
+  bool compare_type(const T& left, const U& right) const {
+    // compare type position in the MsgTypes
+    return
+      boost::mpl::find< MsgTypes, T >::type::pos::value
+      <
+      boost::mpl::find< MsgTypes, U >::type::pos::value;
+  }
+  // comparators for same type
+  bool compare_type(const Msg1& left, const Msg1& right) const {
+    return strcmp( left.seq_num, right.seq_num ) < 0;
+  }
+  bool compare_type(const Msg2& left, const Msg2& right) const {
+    return strcmp( left.external_id, right.external_id ) < 0;
+  }
+  bool compare_type(const Msg3& left, const Msg3& right) const {
+    return left.counter < right.counter;
+  }
+public:
+  template <typename T, typename U>
+  bool operator()( const T& left, const U& right ) const {
+    const int r = strcmp( get_time_field( left ), get_time_field( right ) );
+    if (r != 0) return r < 0;
+    else return compare_type( left, right );
+  }
+};
+```
+--
+...but our queue holds variants, not `Msg1`, `Msg2`, `Msg3`!
+---
+...but our queue holds variants, not `Msg1`, `Msg2`, `Msg3`!
+
+So `MsgComparer` should work in terms of variant (i.e. `MegaMsg`).
+
+Solution:
+```cpp
+// Specialization for MegaMsg - jump from variant to specific message types
+template <>
+inline
+bool MsgComparer::operator()( const MegaMsg& left, const MegaMsg& right ) const
+{
+  return boost::apply_visitor(*this, left, right);
+}
+```
+This works because `boost::apply_visitor` can actually accept several variant arguments:
+```cpp
+boost::apply_visitor(MultiVisitor, variant1, variant2, ...);
+```
+Here we just use `MsgComparer` itself as a binary visitor.
+
+--
+
+### That's all, no more code!
+
+???
+
+See how much code actually was for MPL and Variant!
+* 8 lines for type comparison (with all braces and comments, will become just `return true/false`)
+* 6 lines to apply comparer to variants
+* 2 lines to declare type sequence and variants.
+* 3 includes
+
+---
+
+## What MPL has to offer (since C++98!)
+--
+
+### Integral constants (types)
+* `integral_c<int,5>` - since C++11, `std::integral_constant`
+ * `int_<5>`, `size_t<12>, char_<'a'>` etc.
+ * `bool_<true>` - since C++17, `std::bool_constant`
+
+--
+
+**Operations**:
+* Arithmetic operations: `plus`, `times`, `modulus` etc.
+* Comparisons: `less`, `less_equal`, `equal_to` etc.
+* Bitwise: `shift_left`, `bitand_`, `bitxor_` etc.
+
+--
+
+**Logical**:
+* `and_<is_same<T,U>, is_integral<T>>` - since C++17, `std::conjunction`
+* `or_<is_same<T,U>, is_same<T,V>>` - since C++17, `std::disjunction`
+* `not_<is_pointer<T>>` - since C++17, `std::negation`
+* `if_<is_float<T>,double,int>` - since C++11, `if_c` is `std::conditional`
+  * There are `if_`, `if_c`, `eval_if`, `eval_if_c`
+
+
+---
+## What MPL has to offer (since C++98!)
+
+**Containers**
+
+* `vector<char,int,double>` (and `list`, `deque`)
+ * `at_c<V, 2>::type` is `double`
+ * `at<V, int_<1>>::type` is `int`
+
+* `map< pair<int,int>, pair<string,string_view> >` (and `set`)
+ * `at<M, string>::type` is `string_view`
+
+???
+
+same metafunction `at<>`
+
+this `map` can represent the types you pick for passing as parameters - `string_view` is much lighter than `std::string`
+
+--
+
+* (Lazy) views: `filter_view`, `transform_view`, `joint_view`, `zip_view`
+
+???
+
+'Lazy' means filtering/transformational/zipping metafunctions will be called only when needed
+(if an algo stops earlier they won't be called at all, saving compilation time)
+
+--
+
+* Containers of integral constants
+  * `vector_c<int, 1,3,5>`, `list_c`, `set_c`, `range_c<int,0,10>`
+  * since C++14, `vector_c` is `std::integer_sequence` and <br/>
+    `range_c` is `std::make_integer_sequence`.
+
+--
+
+* `string<'hell','o wo','rld'>`
+  * `c_str<S>::value` will give you a C-string
+
+???
+You can use all sequence algorithms with such a string (`push_front`, `push_back`, `filter`, `transform` to lowercase etc),
+and then you just call `c_str<S>::value` and send this compile-time result to a run-time C function (say write it to a socket) - isn't it cool?!
+
+---
+## What MPL has to offer (since C++98!)
+
+### Algorithms
+
+* Iteration
+  * `accumulate`, `fold`, `reverse_fold`, `iter_fold`
+
+* Searching
+  * `find`, `find_if`, `contains`, `count`, `lower_bound`, `min_element`, `equal`
+
+* Transformation
+  * `copy`, `copy_if`, `transform`, `replace_if`, `unique`, `partition`, `sort`
+  * plus `reverse_xxx` versions
+
+* Run-time<br/>
+  `for_each` - the only runtime algorithm! calls a function with each type in a sequence:<br/>
+  `for_each< range_c<int,0,10> >( [](auto x){ std::cout << x << '\n';} );`
+
+
+---
+## What MPL has to offer (since C++98!)
+
+### Higher-order programming
+
+**Lambdas**
+
+Boost.Lambda gave you in C++98 things like:
+```cpp
+   auto f = _1 + 5 * _2;
+   f(2,3); // returns 17
+```
+
+that are in the language only since C++14:
+```cpp
+   auto f = []( auto x, auto y ){ return x + 5 * y; }
+   f(2,3); // returns 17
+```
+
+???
+Yes, in C++14. In C++11 we only had monomorphic lambdas, no `(auto x, auto y)`.
+
+--
+
+In MPL, that would be:
+```cpp
+   using F = plus< _1, times<int_<5>, _2> >;
+   apply<F,int_<2>,int_<3>>::type // gives int_<17> type
+```
+
+http://coliru.stacked-crooked.com/a/b2358d6f4b33f32e
+
+---
+# A small example: variant
+```cpp
+template<typename Types>
+class variant
+{
+  // Find the biggest type
+  typedef typename max_element<
+      transform_view< Types, sizeof_<_> >
+    >::type iter;
+
+  // Now our storage is big enough for any type from Types
+  char storage[ deref<iter>::type::value ];
+  unsigned current_type;
+
+public:
+  // assign (will compile only if Types contains T)
+  template<typename T>
+  typename enable_if< contains<Types,T>::type::value >::type
+  assign(T&& x) {
+    // current_type is just a position
+    current_type = find< Types, T >::type::pos::value;
+    new(storage) T(std::forward<T>(x));
+  }
+};
+```
+the code is here: http://ideone.com/psNUlT
+
+???
+
+Boost.MPL was a pioneer library but it's now considered outdated, but it was an important step and a prictical working tool for years until C++ was improved.
+
+The coolest now is probably Boost.Hana that almost no compiler can compile (e.g. GCC should be at least v.6),
+there are other libraries that fill the gap between the two:
+
+Boost.Fusion that adds runtime value to compile-time MPL but it also offers similar metaprogramming capabilities via result_of,
+and it also supports variadic templates (at least to some extent).
+
+More recent brigand, fit, meta (inside ranges-v3) fully utilize variadic templates, constexpr, template aliases etc.
+
+There is a lot of new exciting stuff in the land of metaprogramming!
+
+
+    </textarea>
+<script src="https://gnab.github.io/remark/downloads/remark-latest.min.js">
+</script>
+<script>
+    var slideshow = remark.create({
+        highlightLines: true
+    });
+</script>
+</body>
+</html>
